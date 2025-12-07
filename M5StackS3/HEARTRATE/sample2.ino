@@ -41,7 +41,10 @@ void onBeatDetected()
         //pixels.setBrightness(1);
         for (int i = 1; i < NUMPIXELS; i++) {
             // delay(10);
-            pixels.setPixelColor(i, pixels.Color(144, 24, 108));
+            int r = random(255);
+            int g = random(155);
+            int b = random(155);
+            pixels.setPixelColor(i, pixels.Color(r, g, b));
         }
         pixels.show();
         beatflg = false;
@@ -137,6 +140,8 @@ void setup()
     
     Serial.println("\n🚀 MAX30100 + NECO (Smart Health Check)");
     Serial.println("========================================");
+
+    randomSeed(analogRead(0));
     
     // I2C初期化 📍
     Serial.println("📍 I2C PortA (SDA=2, SCL=1)");
