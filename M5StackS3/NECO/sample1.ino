@@ -5,7 +5,7 @@
 #include <Wire.h>  // M5GFXが内部で使用するため必要
 #include <Adafruit_NeoPixel.h>
 
-#define PIN        2       // PortB 🐱
+#define PIN        2       // PortA 🐱
 #define NUMPIXELS  70       // LED数
 #define BLINK_INTERVAL_MS 1000  // 点滅間隔 (ミリ秒)
 
