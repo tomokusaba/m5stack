@@ -5,7 +5,7 @@
 #include <Wire.h>
 #include <Adafruit_NeoPixel.h>
 
-#define PIN        2        // PortB 🐱
+#define PIN        2        // PortA 🐱
 #define NUMPIXELS  70       // LED数
 
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
