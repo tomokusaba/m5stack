@@ -4,7 +4,7 @@
 #include "MAX30100_PulseOximeter.h"
 #include <Adafruit_NeoPixel.h>
 
-#define PIN        18 // PortB 🐱
+#define PIN        17 // PortC 🐱
 #define NUMPIXELS 70
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
