@@ -11,7 +11,7 @@
 // SD.open()で得たfs::FileをDataWrapperに変換する薄いラッパーを用意する
 #include <lgfx/v1/misc/DataWrapper.hpp>
 
-#define PIN        17 // PortB 🐱
+#define PIN        17 // PortC 🐱
 #define NUMPIXELS 70
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
