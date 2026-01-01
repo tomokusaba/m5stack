@@ -1,3 +1,12 @@
+/*
+ * 使用ユニット / Units Used:
+ *   - NECO Unit (NeoPixel LED)
+ *   - タッチスクリーン / Touch Screen
+ * 
+ * ピン配置 / Pin Assignment:
+ *   - NECO Unit: PortA (GPIO 2)
+ */
+
 // 🐱 猫耳LED マルチモード スケッチ
 // タッチボタンで楽しいエフェクトを切り替え！ ✨
 
