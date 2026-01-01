@@ -5,7 +5,7 @@
  *   - microSD カードリーダー / microSD Card Reader (SPI)
  * 
  * ピン配置 / Pin Assignment:
- *   - MAX30100: PortA I2C (SDA=2, SCL=1)
+ *   - MAX30100: PortB I2C (SDA=9, SCL=8)
  *   - NECO Unit: PortA (GPIO 2)
  *   - microSD: SPI (CS=4, SCK=36, MISO=35, MOSI=37)
  */

@@ -7,7 +7,7 @@
  * 
  * ピン配置 / Pin Assignment:
  *   - MAX30100: PortA I2C (SDA=2, SCL=1)
- *   - NECO Unit: PortB (GPIO 17)
+ *   - NECO Unit: PortC (GPIO 17)
  *   - IMU: 内蔵I2C / Internal I2C (SDA=G12, SCL=G11)
  *   - microSD: SPI (CS=4, SCK=36, MISO=35, MOSI=37)
  */
@@ -25,7 +25,7 @@
 // SD.open()で得たfs::FileをDataWrapperに変換する薄いラッパーを用意する
 #include <lgfx/v1/misc/DataWrapper.hpp>
 
-#define PIN        17 // PortB 🐱
+#define PIN        17 // PortC 🐱
 #define NUMPIXELS 70
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
 
