@@ -1,3 +1,13 @@
+/*
+ * 使用ユニット / Units Used:
+ *   - MAX30100 心拍センサー / Heart Rate Sensor (I2C)
+ *   - NECO Unit (NeoPixel LED)
+ * 
+ * ピン配置 / Pin Assignment:
+ *   - MAX30100: PortA I2C (SDA=2, SCL=1)
+ *   - NECO Unit: PortC (GPIO 17)
+ */
+
 #include <M5CoreS3.h>
 #include <Wire.h>
 #include <math.h>

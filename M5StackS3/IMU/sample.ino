@@ -1,3 +1,17 @@
+/*
+ * 使用ユニット / Units Used:
+ *   - MAX30100 心拍センサー / Heart Rate Sensor (I2C)
+ *   - NECO Unit (NeoPixel LED) 
+ *   - IMU (BMI270 + BMM150)
+ *   - microSD カードリーダー / microSD Card Reader (SPI)
+ * 
+ * ピン配置 / Pin Assignment:
+ *   - MAX30100: PortA I2C (SDA=2, SCL=1)
+ *   - NECO Unit: PortC (GPIO 17)
+ *   - IMU: 内蔵I2C / Internal I2C (SDA=G12, SCL=G11)
+ *   - microSD: SPI (CS=4, SCK=36, MISO=35, MOSI=37)
+ */
+
 #include <M5CoreS3.h>
 #include <SPI.h>
 #include <SD.h>

@@ -1,3 +1,11 @@
+/*
+ * 使用ユニット / Units Used:
+ *   - NECO Unit (NeoPixel LED)
+ * 
+ * ピン配置 / Pin Assignment:
+ *   - NECO Unit: PortA (GPIO 2)
+ */
+
 // 🐱 猫耳LED点滅スケッチ (シンプル版)
 // 心拍センサーなし - タイマーベースで点滅 ✨
 
