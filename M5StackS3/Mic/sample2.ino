@@ -1,0 +1,1229 @@
+/*
+ * ============================================================================
+ * Cat Ear LED Multi-Mode Sketch for M5Stack CoreS3
+ * Touch buttons to switch fun effects!
+ * ============================================================================
+ * 
+ * [Hardware Configuration]
+ * - M5Stack CoreS3
+ *   CPU: ESP32-S3 (Dual-core Xtensa LX7, 240MHz)
+ *   Flash: 16MB, PSRAM: 8MB
+ *   Display: 2.0" IPS LCD (320x240), Touch screen
+ * 
+ * [Sensor List]
+ * - 6-axis IMU: BMI270 (0x69) - Accelerometer/Gyroscope
+ * - Magnetometer: BMM150 (0x10) - Compass
+ * - Audio Codec: ES7210 (0x40) - Dual microphone input
+ * 
+ * [Pin Configuration]
+ * - PORT.A (Red): GPIO 2 = Unit Neco (WS2812C-2020 x 70 LEDs)
+ * - Internal I2C: GPIO 12 (SDA), GPIO 11 (SCL)
+ * - Internal Mic: ES7210 via I2S
+ * - Internal Speaker: NS4168 amp via I2S
+ * 
+ * [Unit Neco Details]
+ * - LED: WS2812C-2020 x 70 (35 left ear + 35 right ear)
+ * - Voltage: 5V (from M5Stack PORT.A)
+ * - Data Pin: GPIO 2
+ * 
+ * [IMU to LED Control Mapping]
+ * - Magnetometer (Direction) -> Hue: N=Red, E=Green, S=Blue, W=Purple
+ * - Gyroscope (Rotation) -> Brightness: Rotation speed changes brightness
+ * - Accelerometer (Tilt) -> Saturation: Tilt changes color vividness
+ * 
+ * [Microphone to LED Control Mapping (FFT Analysis)]
+ * - Low freq (60-250Hz) -> Red LEDs, Beat detection (Kick)
+ * - Mid freq (250-2000Hz) -> Green LEDs, Beat detection (Snare)
+ * - High freq (2000-4000Hz) -> Blue LEDs
+ * - FFT: 128 samples, 8kHz sampling
+ * 
+ * [Libraries]
+ * - M5CoreS3.h (M5Stack official)
+ * - Adafruit_NeoPixel.h (LED control)
+ * - arduinoFFT.h (Audio frequency analysis)
+ * 
+ * ============================================================================
+ */
+
+#include <M5CoreS3.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <arduinoFFT.h>  // 🎵 FFTライブラリ
+
+#define PIN        2        // PortA 🐱
+#define NUMPIXELS  70       // LED数
+
+Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
+
+// モード定義 🎮
+enum Mode {
+    MODE_CHASE,      // 流れる光 🌊
+    MODE_BLINK,      // 点滅 💡
+    MODE_RAINBOW,    // 虹色グラデーション 🌈
+    MODE_SPARKLE,    // キラキラ ✨
+    MODE_BREATHE,    // 呼吸（フェード）💨
+    MODE_PARTY,      // パーティー 🎉
+    MODE_IMU,        // 🎮 IMUセンサー制御
+    MODE_MIC,        // 🎤 マイク＋FFT制御
+    MODE_COUNT       // モード数
+};
+
+// ボタン定義 📱
+struct Button {
+    int x, y, w, h;
+    uint16_t color;
+    const char* label;
+    Mode mode;
+};
+
+// 画面下部にボタン配置（320x240画面）
+// 4列 x 2行、各ボタン 75x38、間隔 5px
+Button buttons[] = {
+    {  5, 197, 73, 38, 0x07E0, "CHASE",   MODE_CHASE},    // 緑
+    { 83, 197, 73, 38, 0xFFE0, "BLINK",   MODE_BLINK},    // 黄
+    {161, 197, 73, 38, 0xF81F, "RAINBW",  MODE_RAINBOW},  // マゼンタ
+    {239, 197, 76, 38, 0x07FF, "SPARKL",  MODE_SPARKLE},  // シアン
+    {  5, 155, 73, 38, 0xFD20, "BREATH",  MODE_BREATHE},  // オレンジ
+    { 83, 155, 73, 38, 0xF800, "PARTY",   MODE_PARTY},    // 赤
+    {161, 155, 73, 38, 0x001F, "IMU",     MODE_IMU},      // 🎮 青
+    {239, 155, 76, 38, 0xFC00, "MIC",     MODE_MIC},      // 🎤 黄緑
+};
+const int BUTTON_COUNT = sizeof(buttons) / sizeof(buttons[0]);
+
+// 状態変数
+Mode currentMode = MODE_CHASE;
+uint32_t lastUpdateTime = 0;
+int animPosition = 0;
+int hueOffset = 0;
+bool blinkState = false;
+float breathValue = 0;
+float breathDir = 0.05;
+
+// 🔄 自動モード切り替え用
+uint32_t lastModeChangeTime = 0;
+uint32_t modeChangeInterval = 10000;  // 10秒ごとに切り替え（ミリ秒）
+
+// 🎮 IMUセンサー関連
+bool imuReady = false;
+float imuAccelX = 0, imuAccelY = 0, imuAccelZ = 0;  // 加速度 📐
+float imuGyroX = 0, imuGyroY = 0, imuGyroZ = 0;     // ジャイロ 🔄
+float imuMagX = 0, imuMagY = 0, imuMagZ = 0;        // 磁力計 🧭
+float imuBaseHue = 0;        // 🎨 色相 (0~1)
+float imuSaturation = 0.8f;  // ✨ 彩度 (0~1)
+float imuBrightness = 0.7f;  // 💡 明るさ (0~1)
+
+// 🎤 マイク＋FFT関連
+#define SAMPLES 128              // FFTサンプル数（メモリ削減のため128に）
+#define SAMPLING_FREQ 8000       // サンプリング周波数 (Hz) - 低めに設定
+
+// FFT用配列（staticでグローバルに、floatでメモリ削減）
+static float vReal[SAMPLES];
+static float vImag[SAMPLES];
+ArduinoFFT<float> FFT = ArduinoFFT<float>(vReal, vImag, SAMPLES, SAMPLING_FREQ);
+
+// 🎤 マイクバッファ（staticでスタックオーバーフロー防止）
+static int16_t micBuffer[SAMPLES];
+
+// 🎵 音声分析結果
+float bassLevel = 0;             // 低音域 (0~1)
+float midLevel = 0;              // 中音域 (0~1)
+float highLevel = 0;             // 高音域 (0~1)
+float overallVolume = 0;         // 全体音量 (0~1)
+float beatDetected = 0;          // ビート検出
+float prevBassLevel = 0;         // 前回の低音域
+uint32_t lastBeatTime = 0;       // 最後のビート時刻
+bool micReady = false;           // マイク準備完了
+
+// 🥁 スペクトラルフラックス用（デバッグ表示用にグローバル）
+float gKickFlux = 0;             // キックフラックス
+float gSnareFlux = 0;            // スネアフラックス
+float gKickThresh = 0;           // キック閾値
+float gSnareThresh = 0;          // スネア閾値
+bool useSnareMode = false;       // スネアモード
+int beatCount = 0;               // ビートカウント
+float bpm = 0;                   // 推定BPM
+uint32_t beatTimes[8];           // 最近8回のビート時刻
+int beatTimeIndex = 0;           // ビート時刻インデックス
+
+// 🔊 スピーカー（ビート音）
+bool speakerEnabled = true;      // スピーカー有効/無効
+int beatSoundType = 0;           // ビート音の種類 (0-3)
+uint8_t speakerVolume = 80;      // スピーカー音量 (0-255)
+
+// 速度設定
+int speeds[] = {30, 300, 20, 50, 30, 40, 30, 20};  // 各モードの更新間隔（MIC追加）
+
+// HSVからRGBへ変換 🌈
+uint32_t hsvToColor(int hue, float sat, float val) {
+    hue = hue % 256;
+    int region = hue / 43;
+    int remainder = (hue - (region * 43)) * 6;
+    
+    int p = (int)(255 * val * (1 - sat));
+    int q = (int)(255 * val * (1 - (sat * remainder / 255)));
+    int t = (int)(255 * val * (1 - (sat * (255 - remainder) / 255)));
+    int v = (int)(255 * val);
+    
+    switch (region) {
+        case 0:  return pixels.Color(v, t, p);
+        case 1:  return pixels.Color(q, v, p);
+        case 2:  return pixels.Color(p, v, t);
+        case 3:  return pixels.Color(p, q, v);
+        case 4:  return pixels.Color(t, p, v);
+        default: return pixels.Color(v, p, q);
+    }
+}
+
+// 🌟 HSVからRGBに変換（IMUカラー用、float版）
+void hsvToRgb(float h, float s, float v, uint8_t* r, uint8_t* g, uint8_t* b) {
+    int i = (int)(h * 6);
+    float f = h * 6 - i;
+    float p = v * (1 - s);
+    float q = v * (1 - f * s);
+    float t = v * (1 - (1 - f) * s);
+    
+    float rf, gf, bf;
+    switch (i % 6) {
+        case 0: rf = v; gf = t; bf = p; break;
+        case 1: rf = q; gf = v; bf = p; break;
+        case 2: rf = p; gf = v; bf = t; break;
+        case 3: rf = p; gf = q; bf = v; break;
+        case 4: rf = t; gf = p; bf = v; break;
+        case 5: rf = v; gf = p; bf = q; break;
+        default: rf = v; gf = t; bf = p; break;
+    }
+    *r = (uint8_t)(rf * 255);
+    *g = (uint8_t)(gf * 255);
+    *b = (uint8_t)(bf * 255);
+}
+
+// 🔊 ビート音を再生（ノリノリサウンド！）
+void playBeatSound(bool isSnare) {
+    // 前の音を停止してから新しい音を再生
+    M5.Speaker.stop();
+    
+    if (isSnare) {
+        // 🥁 スネア風: 高めの音で短く「タッ」
+        M5.Speaker.tone(800, 25);  // 800Hz, 25ms
+    } else {
+        // 🥁 キック風: 低めの音で「ドン」
+        switch (beatSoundType) {
+            case 0:  // シンプルキック
+                M5.Speaker.tone(100, 30);  // 100Hz, 30ms
+                break;
+            case 1:  // エレクトロキック
+                M5.Speaker.tone(60, 35);   // 60Hz, 35ms
+                break;
+            case 2:  // ポップキック
+                M5.Speaker.tone(150, 25);  // 150Hz, 25ms
+                break;
+            case 3:  // ハードキック
+                M5.Speaker.tone(80, 40);   // 80Hz, 40ms
+                break;
+        }
+    }
+}
+
+// 🔊 スピーカー ON/OFF 切り替え
+void toggleSpeaker() {
+    speakerEnabled = !speakerEnabled;
+    if (speakerEnabled) {
+        M5.Speaker.tone(1000, 50);  // ON確認音
+        delay(100);
+        M5.Speaker.tone(1500, 50);
+    }
+    Serial.print("🔊 Speaker: ");
+    Serial.println(speakerEnabled ? "ON" : "OFF");
+}
+
+// 🔊 ビート音タイプ切り替え
+void cycleBeatSound() {
+    beatSoundType = (beatSoundType + 1) % 4;
+    // 確認音
+    M5.Speaker.tone(500 + beatSoundType * 200, 100);
+    Serial.print("🎵 Beat sound type: ");
+    Serial.println(beatSoundType);
+}
+
+// 🎮 IMUデータを更新してカラー計算
+void updateIMUColor() {
+    if (!imuReady) return;
+    
+    auto imu_update = M5.Imu.update();
+    if (imu_update) {
+        auto data = M5.Imu.getImuData();
+        
+        // 加速度データ取得 📐
+        imuAccelX = data.accel.x;
+        imuAccelY = data.accel.y;
+        imuAccelZ = data.accel.z;
+        
+        // ジャイロデータ取得 🔄
+        imuGyroX = data.gyro.x;
+        imuGyroY = data.gyro.y;
+        imuGyroZ = data.gyro.z;
+        
+        // 磁力計データ取得 🧭
+        imuMagX = data.mag.x;
+        imuMagY = data.mag.y;
+        imuMagZ = data.mag.z;
+        
+        // 🌈 色相をIMUデータから計算
+        // 磁力計の向き（コンパス）で基本色相を決定
+        float heading = atan2(imuMagY, imuMagX);  // -π ~ π
+        imuBaseHue = (heading + PI) / (2 * PI);   // 0 ~ 1 に正規化
+        
+        // 加速度から傾きを計算して色相をオフセット
+        float tiltX = atan2(imuAccelX, imuAccelZ);
+        float tiltY = atan2(imuAccelY, imuAccelZ);
+        float tiltOffset = (tiltX + tiltY) / (4 * PI);  // 小さめのオフセット
+        
+        imuBaseHue = fmod(imuBaseHue + tiltOffset + 1.0f, 1.0f);
+        
+        // ✨ 明るさをジャイロの回転速度から計算
+        float gyroMagnitude = sqrt(imuGyroX * imuGyroX + 
+                                   imuGyroY * imuGyroY + 
+                                   imuGyroZ * imuGyroZ);
+        imuBrightness = constrain(0.3f + gyroMagnitude / 500.0f, 0.3f, 1.0f);
+        
+        // 🎨 彩度を加速度の大きさから計算
+        float accelMagnitude = sqrt(imuAccelX * imuAccelX + 
+                                    imuAccelY * imuAccelY + 
+                                    imuAccelZ * imuAccelZ);
+        float accelDeviation = abs(accelMagnitude - 1.0f);  // 1Gからの偏差
+        imuSaturation = constrain(0.6f + accelDeviation * 0.4f, 0.6f, 1.0f);
+    }
+}
+
+// 🎨 IMUベースの色を取得（位置オフセット付き）
+void getIMUColor(int pixelIndex, float brightnessMod, uint8_t* r, uint8_t* g, uint8_t* b) {
+    // 位置に応じた色相オフセット（グラデーション効果）
+    float posOffset = (float)pixelIndex / NUMPIXELS * 0.3f;
+    float hue = fmod(imuBaseHue + posOffset, 1.0f);
+    
+    float brightness = imuBrightness * brightnessMod;
+    brightness = constrain(brightness, 0.0f, 1.0f);
+    
+    hsvToRgb(hue, imuSaturation, brightness, r, g, b);
+}
+
+// ボタン描画 🎨
+void drawButtons() {
+    for (int i = 0; i < BUTTON_COUNT; i++) {
+        Button& btn = buttons[i];
+        uint16_t bgColor = (btn.mode == currentMode) ? 0xFFFF : btn.color;
+        uint16_t textColor = (btn.mode == currentMode) ? btn.color : BLACK;
+        
+        M5.Lcd.fillRoundRect(btn.x, btn.y, btn.w, btn.h, 8, bgColor);
+        M5.Lcd.drawRoundRect(btn.x, btn.y, btn.w, btn.h, 8, WHITE);
+        
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(textColor);
+        int textX = btn.x + (btn.w - strlen(btn.label) * 12) / 2;
+        int textY = btn.y + (btn.h - 16) / 2;
+        M5.Lcd.setCursor(textX, textY);
+        M5.Lcd.print(btn.label);
+    }
+}
+
+// タイトル描画 📺
+void drawTitle() {
+    M5.Lcd.fillRect(0, 0, 320, 145, BLACK);
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(30, 5);
+    M5.Lcd.print("NECO PARTY!");
+    
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.setCursor(50, 35);
+    M5.Lcd.print("Mode: ");
+    M5.Lcd.setTextColor(YELLOW);
+    M5.Lcd.print(buttons[currentMode].label);
+}
+
+// 🎤 マイクデバッグ情報を描画（全モード対応）
+void drawMicDebug() {
+    // デバッグエリア（タイトル下、ボタン上）
+    M5.Lcd.fillRect(0, 55, 320, 90, BLACK);
+    
+    // マイク状態
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(5, 58);
+    M5.Lcd.setTextColor(micReady ? GREEN : RED);
+    M5.Lcd.print("MIC: ");
+    M5.Lcd.print(micReady ? "OK" : "NG");
+    
+    // サンプリングレート
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.setCursor(60, 58);
+    M5.Lcd.print("SR:");
+    M5.Lcd.print(SAMPLING_FREQ);
+    M5.Lcd.print("Hz");
+    
+    // ビート検出
+    M5.Lcd.setCursor(140, 58);
+    M5.Lcd.setTextColor(beatDetected > 0.3f ? YELLOW : DARKGREY);
+    M5.Lcd.print("BEAT");
+    if (beatDetected > 0.3f) {
+        M5.Lcd.print("!");  // ビート時に!マーク
+    }
+    
+    // BPM表示
+    M5.Lcd.setCursor(185, 58);
+    M5.Lcd.setTextColor(MAGENTA);
+    M5.Lcd.print("BPM:");
+    if (bpm > 0) {
+        M5.Lcd.print((int)bpm);
+    } else {
+        M5.Lcd.print("---");
+    }
+    
+    // 全体音量
+    M5.Lcd.setCursor(250, 58);
+    M5.Lcd.setTextColor(CYAN);
+    M5.Lcd.print("V:");
+    M5.Lcd.print((int)(overallVolume * 100));
+    
+    // === 周波数帯域バー表示 ===
+    int barY = 72;
+    int barHeight = 18;
+    int barMaxWidth = 200;
+    
+    // 🔴 低音 (Bass) + 適応閾値マーカー
+    M5.Lcd.setTextColor(RED);
+    M5.Lcd.setCursor(5, barY + 2);
+    M5.Lcd.print("BASS");
+    int bassWidth = (int)(bassLevel * barMaxWidth);
+    M5.Lcd.fillRect(45, barY, bassWidth, barHeight, RED);
+    M5.Lcd.drawRect(45, barY, barMaxWidth, barHeight, DARKGREY);
+    
+    // スペクトラルフラックス閾値マーカー（黄色の線）
+    int thresholdX = 45 + (int)(gKickThresh * 10 * barMaxWidth);  // スケール調整
+    if (thresholdX > 45 && thresholdX < 45 + barMaxWidth) {
+        M5.Lcd.drawFastVLine(thresholdX, barY, barHeight, YELLOW);
+        M5.Lcd.drawFastVLine(thresholdX + 1, barY, barHeight, YELLOW);
+    }
+    
+    M5.Lcd.setCursor(250, barY + 2);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.print((int)(bassLevel * 100));
+    M5.Lcd.print("%");
+    
+    // 🟢 中音 (Mid)
+    barY += barHeight + 4;
+    M5.Lcd.setTextColor(GREEN);
+    M5.Lcd.setCursor(5, barY + 2);
+    M5.Lcd.print("MID ");
+    int midWidth = (int)(midLevel * barMaxWidth);
+    M5.Lcd.fillRect(45, barY, midWidth, barHeight, GREEN);
+    M5.Lcd.drawRect(45, barY, barMaxWidth, barHeight, DARKGREY);
+    M5.Lcd.setCursor(250, barY + 2);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.print((int)(midLevel * 100));
+    M5.Lcd.print("%");
+    
+    // 🔵 高音 (High)
+    barY += barHeight + 4;
+    M5.Lcd.setTextColor(BLUE);
+    M5.Lcd.setCursor(5, barY + 2);
+    M5.Lcd.print("HIGH");
+    int highWidth = (int)(highLevel * barMaxWidth);
+    M5.Lcd.fillRect(45, barY, highWidth, barHeight, BLUE);
+    M5.Lcd.drawRect(45, barY, barMaxWidth, barHeight, DARKGREY);
+    M5.Lcd.setCursor(250, barY + 2);
+    M5.Lcd.setTextColor(WHITE);
+    M5.Lcd.print((int)(highLevel * 100));
+    M5.Lcd.print("%");
+}
+
+// Mode switch (common reset process)
+void changeMode(Mode newMode) {
+    currentMode = newMode;
+    animPosition = 0;
+    hueOffset = 0;
+    breathValue = 0;
+    breathDir = 0.05;
+    
+    // Note: Beat detection variables (static in updateMicFFT) are NOT reset
+    // This allows continuous beat detection across mode changes
+    
+    Serial.print("Mode changed: ");
+    Serial.println(buttons[currentMode].label);
+    
+    drawTitle();
+    drawButtons();
+}
+
+// 🎲 ランダムモード切り替え
+void randomModeChange() {
+    Mode newMode;
+    do {
+        newMode = (Mode)random(MODE_COUNT);
+    } while (newMode == currentMode);  // 同じモードは避ける
+    
+    changeMode(newMode);
+    Serial.println("🔄 Auto random mode change!");
+}
+
+// ⏰ 周期的な自動切り替えチェック
+void checkAutoModeChange() {
+    if (millis() - lastModeChangeTime >= modeChangeInterval) {
+        lastModeChangeTime = millis();
+        randomModeChange();
+    }
+}
+
+// タッチチェック 👆
+void checkTouch() {
+    M5.update();
+    
+    if (M5.Touch.getCount() > 0) {
+        auto touch = M5.Touch.getDetail();
+        if (touch.wasPressed()) {
+            int tx = touch.x;
+            int ty = touch.y;
+            
+            for (int i = 0; i < BUTTON_COUNT; i++) {
+                Button& btn = buttons[i];
+                if (tx >= btn.x && tx <= btn.x + btn.w &&
+                    ty >= btn.y && ty <= btn.y + btn.h) {
+                    changeMode(btn.mode);
+                    lastModeChangeTime = millis();  // 手動切り替え時もタイマーリセット
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// === エフェクト関数 ===
+
+// Chase effect + IMU + MIC
+void effectChase() {
+    updateIMUColor();
+    pixels.clear();
+    
+    // 🎤 マイクで尾の長さとスピードが変化
+    int trailLen = 8 + (int)(bassLevel * 12);  // 8～20
+    int speed = 1 + (int)(overallVolume * 3);   // 1～4
+    
+    // IMU + MIC ベースの色相を使用
+    int baseHue = (int)(imuBaseHue * 256) + (int)(midLevel * 30);
+    
+    for (int i = 0; i < trailLen; i++) {
+        int pos = (animPosition - i + NUMPIXELS) % NUMPIXELS;
+        float brightness = 1.0 - ((float)i / trailLen);
+        brightness = brightness * brightness * imuBrightness;
+        
+        // 🥁 ビート時にフラッシュ
+        if (beatDetected > 0.3f && i < 3) {
+            brightness = min(1.0f, brightness + beatDetected * 0.5f);
+        }
+        
+        uint32_t color = hsvToColor((baseHue + pos * 4 + hueOffset) % 256, imuSaturation, brightness);
+        pixels.setPixelColor(pos, color);
+    }
+    
+    animPosition = (animPosition + speed) % NUMPIXELS;
+    hueOffset = (hueOffset + 2) % 256;
+}
+
+// Blink effect + IMU + MIC
+void effectBlink() {
+    updateIMUColor();
+    
+    // IMU + MIC ベースの色相を使用
+    int baseHue = (int)(imuBaseHue * 256);
+    
+    // 🎤 ビート検出で強制点灯
+    bool shouldLight = blinkState || beatDetected > 0.5f;
+    
+    if (shouldLight) {
+        for (int i = 0; i < NUMPIXELS; i++) {
+            float pos = (float)i / NUMPIXELS;
+            // 🎤 位置によって周波数帯域の影響を変える
+            float localBrightness = imuBrightness;
+            if (pos < 0.33f) {
+                localBrightness *= (0.5f + bassLevel * 0.5f);
+            } else if (pos < 0.66f) {
+                localBrightness *= (0.5f + midLevel * 0.5f);
+            } else {
+                localBrightness *= (0.5f + highLevel * 0.5f);
+            }
+            pixels.setPixelColor(i, hsvToColor((baseHue + i * 3) % 256, imuSaturation, localBrightness));
+        }
+    } else {
+        pixels.clear();
+    }
+    blinkState = !blinkState;
+    hueOffset = (hueOffset + 20) % 256;
+}
+
+// Rainbow effect + IMU + MIC
+void effectRainbow() {
+    updateIMUColor();
+    
+    // IMU base hue offset
+    int baseHue = (int)(imuBaseHue * 256);
+    
+    // 🎤 音量で回転速度が変化
+    int rotationSpeed = 2 + (int)(overallVolume * 8);
+    
+    for (int i = 0; i < NUMPIXELS; i++) {
+        int hue = (baseHue + i * 256 / NUMPIXELS + hueOffset) % 256;
+        float brightness = imuBrightness;
+        
+        // 🎤 周波数帯域で明るさ変化
+        float pos = (float)i / NUMPIXELS;
+        if (pos < 0.33f) {
+            brightness *= (0.6f + bassLevel * 0.4f);
+        } else if (pos < 0.66f) {
+            brightness *= (0.6f + midLevel * 0.4f);
+        } else {
+            brightness *= (0.6f + highLevel * 0.4f);
+        }
+        
+        // 🥁 ビート時に白っぽく
+        float sat = imuSaturation;
+        if (beatDetected > 0.3f) {
+            sat = max(0.3f, sat - beatDetected * 0.3f);
+            brightness = min(1.0f, brightness + beatDetected * 0.3f);
+        }
+        
+        pixels.setPixelColor(i, hsvToColor(hue, sat, brightness));
+    }
+    hueOffset = (hueOffset + rotationSpeed) % 256;
+}
+
+// Sparkle effect + IMU + MIC
+void effectSparkle() {
+    updateIMUColor();
+    
+    // IMU base hue
+    int baseHue = (int)(imuBaseHue * 256);
+    
+    // 徐々に暗くする
+    float fadeRate = 0.85f * (0.7f + imuBrightness * 0.3f);
+    for (int i = 0; i < NUMPIXELS; i++) {
+        uint32_t c = pixels.getPixelColor(i);
+        int r = ((c >> 16) & 0xFF) * fadeRate;
+        int g = ((c >> 8) & 0xFF) * fadeRate;
+        int b = (c & 0xFF) * fadeRate;
+        pixels.setPixelColor(i, pixels.Color(r, g, b));
+    }
+    
+    // 🎤 音量でキラキラの量が変化
+    int sparkleCount = 3 + (int)(overallVolume * 10);  // 3～13
+    
+    // ランダムにキラッと光らせる（IMU + MICカラーで）
+    for (int i = 0; i < sparkleCount; i++) {
+        if (random(100) < 40 + (int)(overallVolume * 30)) {
+            int pos = random(NUMPIXELS);
+            // 🎤 周波数帯域で色分け
+            int hueOffset = 0;
+            if (bassLevel > midLevel && bassLevel > highLevel) {
+                hueOffset = 0;    // 低音=赤系
+            } else if (midLevel > highLevel) {
+                hueOffset = 85;   // 中音=緑系
+            } else {
+                hueOffset = 170;  // 高音=青系
+            }
+            pixels.setPixelColor(pos, hsvToColor((baseHue + hueOffset + random(30)) % 256, imuSaturation * 0.5f, 1.0));
+        }
+    }
+    
+    // 🥁 ビート時に全体フラッシュ
+    if (beatDetected > 0.5f) {
+        for (int i = 0; i < NUMPIXELS; i += 3) {
+            pixels.setPixelColor(i, hsvToColor(baseHue, 0.3f, beatDetected));
+        }
+    }
+}
+
+// Breathe effect + IMU + MIC
+void effectBreathe() {
+    updateIMUColor();
+    
+    // IMU base hue
+    int baseHue = (int)(imuBaseHue * 256);
+    
+    // 🎤 音量で呼吸速度が変化
+    float breathSpeed = 0.03f + overallVolume * 0.05f;
+    
+    breathValue += breathDir * breathSpeed / 0.03f;
+    if (breathValue >= 1.0) {
+        breathValue = 1.0;
+        breathDir = -0.03;
+    } else if (breathValue <= 0.05) {
+        breathValue = 0.05;
+        breathDir = 0.03;
+        hueOffset = (hueOffset + 30) % 256;
+    }
+    
+    // 🥁 ビート時は呼吸をリセットして最大に
+    if (beatDetected > 0.5f) {
+        breathValue = 1.0f;
+        breathDir = -0.03;
+    }
+    
+    // 呼吸の明るさにIMUの明るさも合成
+    float finalBrightness = breathValue * imuBrightness;
+    
+    for (int i = 0; i < NUMPIXELS; i++) {
+        // 🎤 位置によって周波数帯域の色を混ぜる
+        float pos = (float)i / NUMPIXELS;
+        int hue = (baseHue + hueOffset) % 256;
+        if (pos < 0.33f && bassLevel > 0.3f) {
+            hue = (hue + 0) % 256;    // 低音=赤寄り
+        } else if (pos > 0.66f && highLevel > 0.3f) {
+            hue = (hue + 170) % 256;  // 高音=青寄り
+        }
+        pixels.setPixelColor(i, hsvToColor(hue, imuSaturation, finalBrightness));
+    }
+}
+
+// Party effect + IMU + MIC
+void effectParty() {
+    updateIMUColor();
+    
+    // IMU base hue
+    int baseHue = (int)(imuBaseHue * 256);
+    
+    // 🎤 音量で点灯確率が変化
+    int lightChance = 20 + (int)(overallVolume * 40);  // 20～60%
+    
+    for (int i = 0; i < NUMPIXELS; i++) {
+        if (random(100) < lightChance) {
+            // 🎤 周波数帯域で色を決定
+            int hue;
+            float pos = (float)i / NUMPIXELS;
+            if (pos < 0.33f) {
+                hue = (baseHue + (int)(bassLevel * 60)) % 256;      // 低音域
+            } else if (pos < 0.66f) {
+                hue = (baseHue + 85 + (int)(midLevel * 60)) % 256;  // 中音域
+            } else {
+                hue = (baseHue + 170 + (int)(highLevel * 60)) % 256; // 高音域
+            }
+            
+            float brightness = imuBrightness * (0.7f + overallVolume * 0.3f);
+            pixels.setPixelColor(i, hsvToColor(hue, imuSaturation, brightness));
+        } else {
+            uint32_t c = pixels.getPixelColor(i);
+            int r = ((c >> 16) & 0xFF) * 0.7;
+            int g = ((c >> 8) & 0xFF) * 0.7;
+            int b = (c & 0xFF) * 0.7;
+            pixels.setPixelColor(i, pixels.Color(r, g, b));
+        }
+    }
+    
+    // 🥁 ビート時に全LEDフラッシュ
+    if (beatDetected > 0.6f) {
+        for (int i = 0; i < NUMPIXELS; i++) {
+            pixels.setPixelColor(i, hsvToColor(baseHue, 0.2f, beatDetected));
+        }
+    }
+}
+
+// IMU sensor effect (Aurora style) + MIC
+static float auroraOffset = 0;
+void effectIMU() {
+    updateIMUColor();
+    
+    // Volume affects aurora speed
+    float auroraSpeed = 0.05f + overallVolume * 0.15f;
+    auroraOffset += auroraSpeed;
+    
+    for (int i = 0; i < NUMPIXELS; i++) {
+        // 2つの波を重ねてゆらぎを表現
+        float wave1 = sin(auroraOffset + (float)i * 0.15f) * 0.5f + 0.5f;
+        float wave2 = sin(auroraOffset * 0.7f + (float)i * 0.1f) * 0.5f + 0.5f;
+        
+        float brightness = (wave1 + wave2) * 0.5f;
+        
+        // 🎤 周波数帯域で明るさを変調
+        float pos = (float)i / NUMPIXELS;
+        if (pos < 0.33f) {
+            brightness *= (0.7f + bassLevel * 0.5f);
+        } else if (pos < 0.66f) {
+            brightness *= (0.7f + midLevel * 0.5f);
+        } else {
+            brightness *= (0.7f + highLevel * 0.5f);
+        }
+        
+        uint8_t r, g, b;
+        getIMUColor(i, brightness, &r, &g, &b);
+        
+        // オーロラっぽい緑を少し追加 🌌
+        g = min(255, (int)(g + wave2 * 30));
+        
+        // 🥁 ビート時にフラッシュ
+        if (beatDetected > 0.4f && i % 2 == 0) {
+            r = min(255, (int)(r + beatDetected * 100));
+            g = min(255, (int)(g + beatDetected * 100));
+            b = min(255, (int)(b + beatDetected * 100));
+        }
+        
+        pixels.setPixelColor(i, pixels.Color(r, g, b));
+    }
+}
+
+// 🎤 マイクからサンプリングしてFFT分析
+void updateMicFFT() {
+    if (!micReady) {
+        // マイクが準備できていない場合はダミーデータ
+        bassLevel = 0.1f;
+        midLevel = 0.1f;
+        highLevel = 0.1f;
+        return;
+    }
+    
+    // M5CoreS3の内蔵マイク (ES7210) から取得
+    // record()はブロッキング呼び出し
+    if (!M5.Mic.record(micBuffer, SAMPLES, SAMPLING_FREQ, false)) {
+        // 読み取り失敗時はスキップ
+        return;
+    }
+    
+    // 録音完了を待つ（タイムアウト付き）
+    uint32_t waitStart = millis();
+    while (M5.Mic.isRecording()) {
+        if (millis() - waitStart > 100) {  // 100msタイムアウト
+            Serial.println("⚠️ Mic timeout");
+            return;
+        }
+        delay(1);
+    }
+    
+    // DC offset removal (important for beat detection!)
+    int32_t dcOffset = 0;
+    for (int i = 0; i < SAMPLES; i++) {
+        dcOffset += micBuffer[i];
+    }
+    dcOffset /= SAMPLES;
+    
+    // FFT data with DC removal and windowing prep
+    for (int i = 0; i < SAMPLES; i++) {
+        vReal[i] = (float)(micBuffer[i] - dcOffset);
+        vImag[i] = 0;
+    }
+        
+    // FFT execution
+    FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+    FFT.compute(FFTDirection::Forward);
+    FFT.complexToMagnitude();
+    
+    // Frequency resolution: 8000Hz / 128 = 62.5Hz/bin
+    float binWidth = (float)SAMPLING_FREQ / SAMPLES;
+    
+    // ============================================================
+    // IMPROVED BEAT DETECTION - Energy-based with Sub-band Analysis
+    // ============================================================
+    
+    // Sub-band energy calculation (more precise frequency ranges)
+    // NOTE: Raised low cutoff from 40Hz to 80Hz to avoid room noise/hum
+    // Kick drum: 80-150Hz - fundamental of bass drum (avoiding sub-bass noise)
+    // Snare body: 150-400Hz - body of snare
+    // Snare snap: 2000-4000Hz - snare wire brightness
+    
+    float subBass = 0;    // 80-150Hz  - Kick fundamental (raised from 40Hz)
+    float lowMid = 0;     // 150-400Hz - Snare body
+    float highMid = 0;    // 2000-4000Hz - Snare snap/brightness
+    
+    for (int i = 1; i < SAMPLES / 2; i++) {
+        float freq = i * binWidth;
+        float mag = vReal[i];
+        
+        // Skip very low frequencies (noise floor: fans, hum, rumble)
+        // Raised cutoff to 120Hz to avoid room noise, HVAC, PC fans etc.
+        if (freq >= 120 && freq < 200) {
+            subBass += mag * mag;  // Use power (squared) for better dynamics
+        } else if (freq >= 200 && freq < 500) {
+            lowMid += mag * mag;
+        } else if (freq >= 2000 && freq < 4000) {
+            highMid += mag * mag;
+        }
+    }
+    
+    // Convert to RMS-like values (very high divisors to reduce sensitivity)
+    subBass = sqrtf(subBass) / 6000.0f;  // Much higher divisor
+    lowMid = sqrtf(lowMid) / 5000.0f;
+    highMid = sqrtf(highMid) / 2000.0f;
+    
+    // ============================================================
+    // SILENCE DETECTION - Stop beat detection when audio is too quiet
+    // ============================================================
+    float totalEnergy = subBass + lowMid + highMid;
+    static float avgEnergy = 0;
+    avgEnergy = avgEnergy * 0.95f + totalEnergy * 0.05f;
+    
+    // If average energy is below noise floor, skip beat detection
+    // Your avgE shows ~1.5 in quiet room, so set threshold to 2.5
+    // Only real music/sound should exceed this
+    bool isSilent = (avgEnergy < 2.5f);
+    
+    // ============================================================
+    // ONSET DETECTION using first-order difference + half-wave rectification
+    // ============================================================
+    static float prevSubBass = 0, prevLowMid = 0, prevHighMid = 0;
+    
+    // Calculate onset (only positive changes = sound starting)
+    float kickOnset = max(0.0f, subBass - prevSubBass);
+    float snareBodyOnset = max(0.0f, lowMid - prevLowMid);
+    float snareSnapOnset = max(0.0f, highMid - prevHighMid);
+    
+    // Combined snare onset (body + snap)
+    float snareOnset = snareBodyOnset * 0.6f + snareSnapOnset * 0.4f;
+    
+    // Store for next frame
+    prevSubBass = subBass;
+    prevLowMid = lowMid;
+    prevHighMid = highMid;
+    
+    // If silent, reset onset values to prevent false triggers
+    if (isSilent) {
+        kickOnset = 0;
+        snareOnset = 0;
+    }
+    
+    // ============================================================
+    // ADAPTIVE THRESHOLD with exponential moving average
+    // ============================================================
+    #define ONSET_HISTORY 16
+    static float kickOnsetHist[ONSET_HISTORY] = {0};
+    static float snareOnsetHist[ONSET_HISTORY] = {0};
+    static int onsetIdx = 0;
+    
+    kickOnsetHist[onsetIdx] = kickOnset;
+    snareOnsetHist[onsetIdx] = snareOnset;
+    onsetIdx = (onsetIdx + 1) % ONSET_HISTORY;
+    
+    // Calculate mean and variance for adaptive threshold
+    float kickMean = 0, snareMean = 0;
+    float kickMax = 0, snareMax = 0;
+    for (int i = 0; i < ONSET_HISTORY; i++) {
+        kickMean += kickOnsetHist[i];
+        snareMean += snareOnsetHist[i];
+        if (kickOnsetHist[i] > kickMax) kickMax = kickOnsetHist[i];
+        if (snareOnsetHist[i] > snareMax) snareMax = snareOnsetHist[i];
+    }
+    kickMean /= ONSET_HISTORY;
+    snareMean /= ONSET_HISTORY;
+    
+    // Adaptive threshold: mean + factor * (max - mean)
+    // Higher factor = stricter detection
+    float kickThresh = kickMean + (kickMax - kickMean) * 0.6f + 0.02f;
+    float snareThresh = snareMean + (snareMax - snareMean) * 0.6f + 0.02f;
+    
+    // Minimum threshold floor (noise gate) - VERY HIGH to prevent false triggers
+    kickThresh = max(kickThresh, 0.12f);
+    snareThresh = max(snareThresh, 0.10f);
+    
+    // Global variables for debug display
+    gKickFlux = kickOnset;
+    gSnareFlux = snareOnset;
+    gKickThresh = kickThresh;
+    gSnareThresh = snareThresh;
+    
+    // ============================================================
+    // BEAT DECISION with refractory period
+    // ============================================================
+    uint32_t timeSinceLastBeat = millis() - lastBeatTime;
+    bool isBeat = false;
+    
+    // Only detect beats when not silent
+    if (!isSilent && timeSinceLastBeat > 250) {
+        // Kick has priority over snare
+        if (kickOnset > kickThresh && kickOnset > snareOnset * 1.2f) {
+            // Clear kick detected
+            isBeat = true;
+            useSnareMode = false;
+        } else if (snareOnset > snareThresh) {
+            // Snare detected (including when kick is not dominant)
+            isBeat = true;
+            useSnareMode = true;
+        }
+    }
+    
+    if (isBeat) {
+        beatDetected = 1.0f;
+        
+        // BPM calculation
+        beatTimes[beatTimeIndex] = millis();
+        beatTimeIndex = (beatTimeIndex + 1) % 8;
+        beatCount++;
+        
+        if (beatCount >= 8) {
+            uint32_t totalInterval = 0;
+            int validIntervals = 0;
+            for (int i = 0; i < 7; i++) {
+                int idx1 = (beatTimeIndex + i) % 8;
+                int idx2 = (beatTimeIndex + i + 1) % 8;
+                uint32_t interval = beatTimes[idx2] - beatTimes[idx1];
+                if (interval > 200 && interval < 1500) {
+                    totalInterval += interval;
+                    validIntervals++;
+                }
+            }
+            if (validIntervals > 0) {
+                bpm = 60000.0f / ((float)totalInterval / validIntervals);
+            }
+        }
+        
+        lastBeatTime = millis();
+        Serial.print(useSnareMode ? "SNARE " : "KICK ");
+        Serial.print("onset:");
+        Serial.print(useSnareMode ? snareOnset : kickOnset, 3);
+        Serial.print(" th:");
+        Serial.print(useSnareMode ? snareThresh : kickThresh, 3);
+        Serial.print(" BPM:");
+        Serial.println((int)bpm);
+    } else {
+        beatDetected *= 0.88f;  // Slightly slower decay for visual effect
+    }
+    
+    // Debug output every 500ms to monitor noise levels
+    static uint32_t lastDebugTime = 0;
+    if (millis() - lastDebugTime > 500) {
+        lastDebugTime = millis();
+        Serial.print("[DBG] avgE:");
+        Serial.print(avgEnergy, 4);
+        Serial.print(" kickOn:");
+        Serial.print(kickOnset, 4);
+        Serial.print(" snareOn:");
+        Serial.print(snareOnset, 4);
+        Serial.print(" kTh:");
+        Serial.print(kickThresh, 3);
+        Serial.print(" sTh:");
+        Serial.print(snareThresh, 3);
+        Serial.print(" silent:");
+        Serial.println(isSilent ? "YES" : "NO");
+    }
+    
+    // ============================================================
+    // DISPLAY VALUES (separate from beat detection)
+    // ============================================================
+    float bassSum = 0, midSum = 0, highSum = 0;
+    int bassCount = 0, midCount = 0, highCount = 0;
+    
+    for (int i = 1; i < SAMPLES / 2; i++) {
+        float freq = i * binWidth;
+        float mag = vReal[i];
+        
+        if (freq >= 60 && freq < 250) {
+            bassSum += mag;
+            bassCount++;
+        } else if (freq >= 250 && freq < 2000) {
+            midSum += mag;
+            midCount++;
+        } else if (freq >= 2000 && freq < 4000) {
+            highSum += mag;
+            highCount++;
+        }
+    }
+    
+    float newBass = bassCount > 0 ? bassSum / bassCount / 5000.0f : 0;
+    float newMid = midCount > 0 ? midSum / midCount / 4000.0f : 0;
+    float newHigh = highCount > 0 ? highSum / highCount / 3000.0f : 0;
+    
+    newBass = constrain(newBass, 0, 1);
+    newMid = constrain(newMid, 0, 1);
+    newHigh = constrain(newHigh, 0, 1);
+    
+    // Smoothing for display
+    bassLevel = bassLevel * 0.5f + newBass * 0.5f;
+    midLevel = midLevel * 0.5f + newMid * 0.5f;
+    highLevel = highLevel * 0.5f + newHigh * 0.5f;
+    overallVolume = (bassLevel + midLevel + highLevel) / 3.0f;
+}
+
+// Mic effect (spectrum style)
+static float micHueOffset = 0;
+void effectMic() {
+    updateIMUColor();
+    
+    micHueOffset += 0.5f + overallVolume * 2.0f;  // Volume affects rotation speed
+    
+    // LEDを周波数帯域で色分け
+    // 低音（赤系）→ 中音（緑系）→ 高音（青系）
+    
+    for (int i = 0; i < NUMPIXELS; i++) {
+        float pos = (float)i / NUMPIXELS;
+        
+        // 位置に応じて周波数帯域の影響を変える
+        float bassInfluence, midInfluence, highInfluence;
+        
+        if (pos < 0.33f) {
+            // 下部: 低音域メイン
+            bassInfluence = 1.0f;
+            midInfluence = 0.3f;
+            highInfluence = 0.1f;
+        } else if (pos < 0.66f) {
+            // 中部: 中音域メイン
+            bassInfluence = 0.3f;
+            midInfluence = 1.0f;
+            highInfluence = 0.3f;
+        } else {
+            // 上部: 高音域メイン
+            bassInfluence = 0.1f;
+            midInfluence = 0.3f;
+            highInfluence = 1.0f;
+        }
+        
+        // 各帯域の強度を合成
+        float localLevel = bassLevel * bassInfluence + 
+                          midLevel * midInfluence + 
+                          highLevel * highInfluence;
+        localLevel = constrain(localLevel, 0, 1);
+        
+        // 色相: 低音=赤(0), 中音=緑(85), 高音=青(170)
+        int hue;
+        if (bassInfluence > midInfluence && bassInfluence > highInfluence) {
+            hue = (int)(micHueOffset + 0) % 256;    // 赤系
+        } else if (midInfluence > highInfluence) {
+            hue = (int)(micHueOffset + 85) % 256;   // 緑系
+        } else {
+            hue = (int)(micHueOffset + 170) % 256;  // 青系
+        }
+        
+        // IMUの影響も加える
+        hue = (hue + (int)(imuBaseHue * 50)) % 256;
+        
+        // ビート検出時は白くフラッシュ
+        float brightness = localLevel * 0.8f + 0.1f;
+        float saturation = imuSaturation;
+        
+        if (beatDetected > 0.3f && pos < 0.5f) {
+            // ビート時、下半分がフラッシュ
+            brightness = min(1.0f, brightness + beatDetected * 0.5f);
+            saturation = max(0.3f, saturation - beatDetected * 0.3f);
+        }
+        
+        brightness = brightness * imuBrightness;
+        pixels.setPixelColor(i, hsvToColor(hue, saturation, constrain(brightness, 0, 1)));
+    }
+}
+
+void setup()
+{
+    M5.begin();
+    M5.Power.begin();
+    Serial.begin(115200);
+    
+    Serial.println("\n🐱 NECO LED Party Mode!");
+    Serial.println("========================");
+
+    randomSeed(analogRead(0));
+    
+    // 🎮 IMU初期化 (BMI270 + BMM150) - 内部I2C (SDA=G12, SCL=G11)
+    Serial.println("🎮 Initializing IMU (BMI270+BMM150)...");
+    if (M5.Imu.begin()) {
+        imuReady = true;
+        Serial.println("✅ IMU ready! (BMI270 @ 0x69, BMM150 @ 0x10)");
+    } else {
+        imuReady = false;
+        Serial.println("⚠️ IMU init failed - IMU mode will use fallback colors");
+    }
+    
+    // 🎤 マイク初期化 (ES7210 オーディオコーデック)
+    Serial.println("🎤 Initializing Microphone (ES7210)...");
+    auto mic_cfg = M5.Mic.config();
+    mic_cfg.sample_rate = SAMPLING_FREQ;
+    mic_cfg.dma_buf_count = 4;
+    mic_cfg.dma_buf_len = 256;
+    M5.Mic.config(mic_cfg);
+    
+    if (M5.Mic.begin()) {
+        micReady = true;
+        Serial.println("✅ Microphone ready! (ES7210 @ 0x40)");
+        Serial.print("   Sample Rate: ");
+        Serial.print(SAMPLING_FREQ);
+        Serial.println(" Hz");
+    } else {
+        micReady = false;
+        Serial.println("⚠️ Microphone init failed - MIC mode will use fallback");
+    }
+    
+    // 🔊 スピーカー初期化（ビート音用）
+    Serial.println("🔊 Initializing Speaker...");
+    auto spk_cfg = M5.Speaker.config();
+    spk_cfg.sample_rate = 44100;
+    spk_cfg.task_priority = 1;
+    M5.Speaker.config(spk_cfg);
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(speakerVolume);
+    Serial.println("✅ Speaker ready!");
+    
+    // 猫耳LED初期化 🐱
+    pixels.setBrightness(20);  // 🔥 LED焼損防止のため20に変更
+    pixels.begin();
+    pixels.clear();
+    pixels.show();
+    Serial.println("✅ NECO OK!");
+    
+    // 画面初期化 📺
+    M5.Lcd.fillScreen(BLACK);
+    drawTitle();
+    drawButtons();
+    
+    // 🔄 自動切り替えタイマー初期化
+    lastModeChangeTime = millis();
+    
+    Serial.println("✨ Touch buttons to change mode!");
+    Serial.print("🔄 Auto mode change every ");
+    Serial.print(modeChangeInterval / 1000);
+    Serial.println(" seconds!");
+}
+
+// 🎤 デバッグ表示用タイマー
+uint32_t lastDebugUpdate = 0;
+const uint32_t DEBUG_UPDATE_INTERVAL = 100;  // 100msごとに更新
+
+void loop()
+{
+    // Touch check
+    checkTouch();
+    
+    // Auto mode change
+    checkAutoModeChange();
+    
+    // FFT/Beat detection - ALWAYS update every loop (independent of animation speed)
+    updateMicFFT();
+    
+    // Debug display update (every 100ms)
+    if (millis() - lastDebugUpdate >= DEBUG_UPDATE_INTERVAL) {
+        lastDebugUpdate = millis();
+        drawMicDebug();
+        
+        // Serial detailed output
+        Serial.print("Bass:");
+        Serial.print((int)(bassLevel * 100));
+        Serial.print("% Mid:");
+        Serial.print((int)(midLevel * 100));
+        Serial.print("% High:");
+        Serial.print((int)(highLevel * 100));
+        Serial.print("% Beat:");
+        Serial.print(beatDetected, 2);
+        Serial.println();
+    }
+    
+    // Animation update (speed varies by mode)
+    if (millis() - lastUpdateTime >= speeds[currentMode]) {
+        lastUpdateTime = millis();
+        
+        switch (currentMode) {
+            case MODE_CHASE:   effectChase();   break;
+            case MODE_BLINK:   effectBlink();   break;
+            case MODE_RAINBOW: effectRainbow(); break;
+            case MODE_SPARKLE: effectSparkle(); break;
+            case MODE_BREATHE: effectBreathe(); break;
+            case MODE_PARTY:   effectParty();   break;
+            case MODE_IMU:     effectIMU();     break;
+            case MODE_MIC:     effectMic();     break;
+            default: break;
+        }
+        
+        pixels.show();
+    }
+}
+
